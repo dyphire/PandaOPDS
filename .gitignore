@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Build / tooling artifacts
+dist/
+build/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.hypothesis/
+
+# Environment (keep the example template)
+.env
+.env.*
+!.env.example
+
+# Runtime data — NOTE: anchored to the repo root only; app/cache/ is source
+# code (disk/memory cache layers) and must stay tracked.
+/cache/
+tests/fixtures/
+config/home.toml
+archives/
+favorites_sync.json
+mytags.json
+tag_translation.json
+
+# Reference repo (own git history, read-only per AGENTS.md)
+/example/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Logs
+*.log
+
+# Editor temp / backup files
+*~
+*.swp
+*.swo
+*.bak
+*.orig
+*.tmp
+
+# Local build artifacts
+coverage.xml
+*.whl
+
+# Test artifacts
+.pytest_cache/

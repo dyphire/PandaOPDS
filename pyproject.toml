@@ -1,0 +1,39 @@
+[project]
+name = "pandaopds"
+# Single source of truth for the app version lives in app/__init__.py
+# (__version__); keep this in sync (tests/test_version.py asserts it).
+version = "0.2.0"
+description = "OPDS-PSE streaming server proxying E-Hentai.org"
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "lxml>=5.0",
+    "cssselect>=1.2",
+    "python-dotenv>=1.0",
+    "py7zr>=0.21",  # 7z -> zip conversion for rare 7z archives
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.webui" = ["*.html"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,765 @@
+"""E-Hentai service layer: orchestrates client, parser, cache and throttle.
+
+Every upstream access goes through this class (project rule #3).
+Pipeline for one image: page-URL cache -> detail page (1 req / 20 pages)
+-> /s/ page (image URL) -> image bytes (disk cached).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Awaitable, Callable
+
+from ..cache.disk import DiskImageCache, detect_image_type
+from ..cache.memory import MemoryCache
+from ..config import Settings
+from ..throttle.limiter import KIND_API, KIND_HTML, KIND_IMAGE, KIND_THUMB, Throttle
+from .client import EHClient
+from .exceptions import (
+    BannedError,
+    CloudflareError,
+    EHException,
+    EHServerError,
+    ExceedLimitError,
+    GalleryDeletedError,
+    PageNotFoundError,
+)
+from .models import (
+    DetailPageInfo,
+    GalleryMetadata,
+    GalleryPageInfo,
+    ImagePageInfo,
+    TagStyle,
+)
+from .mytags import MyTagsMap
+from .query_ext import extract_adv_params
+from .parser import (
+    parse_detail_page,
+    parse_favorites_categories,
+    parse_gdata_response,
+    parse_image_page,
+    parse_list_page,
+    parse_mytags,
+)
+
+logger = logging.getLogger(__name__)
+
+GDATA_BATCH_SIZE = 25
+THUMBS_PER_DETAIL_PAGE = 20
+
+# Ranklist periods -> `?tl=` value (day=15, month=13, year=12, allTime=11).
+TOPLIST_TL = {"yesterday": 15, "month": 13, "year": 12, "alltime": 11}
+
+
+class EHService:
+    def __init__(
+        self,
+        settings: Settings,
+        client: EHClient | None = None,
+        throttle: Throttle | None = None,
+        memory_cache: MemoryCache | None = None,
+        disk_cache: DiskImageCache | None = None,
+    ):
+        self.settings = settings
+        self.client = client or EHClient(settings)
+        self.throttle = throttle or Throttle(settings)
+        self.mem = memory_cache or MemoryCache()
+        self.disk = disk_cache or (
+            DiskImageCache(
+                settings.cache_dir,
+                max_gb=settings.cache_max_gb,
+                enabled=settings.image_cache_enabled,
+            )
+        )
+        self.site_host = settings.site_host
+        # Optional archive manager (injected by main): when set, /stream serves
+        # pages straight from the persistent zip master before touching the
+        # disk LRU or the upstream pipeline.
+        self.archive = None
+        # Static tag-style map from /mytags (detail-subject highlighting);
+        # lazy TTL refresh, disk-persisted.
+        self.mytags = MyTagsMap(settings.mytags_state, settings.mytags_ttl_seconds)
+        # Optional EhTagTranslation dictionary (injected by main when
+        # TAG_TRANSLATION_ENABLED): rewrites translated tag tokens in search
+        # queries into native EH keyword syntax before they hit upstream.
+        self.translator = None
+
+    def attach_archive(self, manager) -> None:
+        self.archive = manager
+
+    async def close(self) -> None:
+        await self.client.close()
+
+    # -- internal helpers --------------------------------------------------
+
+    def _mem_key(self, *parts: object) -> str:
+        return ":".join(str(p) for p in parts)
+
+    async def _cached(
+        self,
+        key: str,
+        ttl: float,
+        factory: Callable[[], Awaitable],
+    ):
+        return await self.mem.get_or_set(key, factory, ttl)
+
+    async def _trip_if_fatal(self, exc: EHException) -> None:
+        """Trip the circuit breaker for hard failures (banned / image limit).
+
+        Cooldowns are graded by recovery horizon: an IP ban lasts hours
+        (long cooldown, few probe attempts), while the image quota rolls
+        over within minutes (short cooldown, fast recovery).
+        """
+        if isinstance(exc, BannedError):
+            await self.throttle.trip(
+                f"{type(exc).__name__}: {exc}",
+                cooldown=self.settings.banned_cooldown_seconds,
+            )
+        elif isinstance(exc, ExceedLimitError):
+            await self.throttle.trip(
+                f"{type(exc).__name__}: {exc}",
+                cooldown=self.settings.exceed_cooldown_seconds,
+            )
+
+    # -- list pages --------------------------------------------------------
+
+    async def _list_page(
+        self,
+        kind: str,
+        path: str,
+        params: dict[str, str] | None = None,
+    ) -> GalleryPageInfo:
+        """Fetch + parse a list page, caching the parse result (short TTL).
+
+        List pages are the cheapest upstream objects but the home feed and
+        toplist feeds hit them repeatedly, so parse results are cached for
+        `list_cache_ttl_seconds` (default 10min).
+
+        An ``inline_set`` parameter is always injected so the page renders in
+        the server's configured layout (default ``dm_e`` / Extended, which
+        exposes the full tag set and richest metadata) regardless of the
+        user's web-browser default view.
+        """
+        params = dict(params or {})
+        params["inline_set"] = self.settings.inline_set_key
+        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        key = self._mem_key("list", kind, query)
+
+        async def _fetch() -> GalleryPageInfo:
+            html_text = await self._html_get(path, params=params)
+            info = parse_list_page(html_text)
+            # Remember covers so thumbnail proxies never need the gdata API:
+            # a list page serves the cover URLs for all its galleries (TTL
+            # outlives the 10min list cache, matching the detail-page cache).
+            cover_ttl = self.settings.page_url_ttl_seconds
+            for g in info.galleries:
+                if g.cover_url:
+                    await self.mem.set(
+                        self._mem_key("cover", g.gid, g.token), g.cover_url, cover_ttl
+                    )
+            return info
+
+        return await self.mem.get_or_set(
+            key, _fetch, self.settings.list_cache_ttl_seconds
+        )
+
+    async def search_galleries(
+        self,
+        query: str = "",
+        last_gid: str | None = None,
+        f_cats: int | None = None,
+    ) -> GalleryPageInfo:
+        """Search / latest list page.
+
+        `last_gid` enables `next` pagination — an opaque cursor string
+        (either a plain gid or a `gid-favoritedAt` composite from favorites).
+        `f_cats` is the EH exclude-category bitmask (e.g. 1021 = Doujinshi only).
+
+        Extension keywords embedded in `query` (rating:5 / expunged /
+        nohide:uploader|language|tags|all) are stripped and translated into
+        advanced-search URL params (see app/eh/query_ext.py); translated tag
+        names (EhTagTranslation, opt-in) are rewritten into native keyword
+        syntax; the stripped remainder goes into f_search. Adv params join
+        `params`, so they are automatically part of the list-cache key (no
+        collisions between differently-filtered searches) and ride along on
+        `next` pagination.
+        """
+        query, adv_params = extract_adv_params(query)
+        if self.translator is not None:
+            query = self.translator.translate_query(query)
+        params: dict[str, str] = dict(adv_params)
+        if query:
+            params["f_search"] = query
+        if f_cats is not None:
+            params["f_cats"] = str(f_cats)
+        if last_gid is not None:
+            params["next"] = str(last_gid)
+        # Cache key includes f_cats so different category filters don't collide.
+        q_key = f"{query}:f_cats={f_cats}" if f_cats is not None else query
+        return await self._list_page("search:" + q_key, "/", params)
+
+    async def popular_galleries(self, last_gid: str | None = None) -> GalleryPageInfo:
+        params = {"next": str(last_gid)} if last_gid is not None else {}
+        return await self._list_page("popular", "/popular", params)
+
+    async def watched_galleries(self, last_gid: str | None = None) -> GalleryPageInfo:
+        """Watched galleries list (/watched). Reuses the standard list parser."""
+        params = {"next": str(last_gid)} if last_gid is not None else {}
+        return await self._list_page("watched", "/watched", params)
+
+    async def favorites_galleries(self, last_gid: str | None = None) -> GalleryPageInfo:
+        """Favorites list (/favorites.php). Reuses the standard list parser."""
+        params = {"next": str(last_gid)} if last_gid is not None else {}
+        return await self._list_page("favorites", "/favorites.php", params)
+
+    async def toplist_galleries(
+        self, period: str = "yesterday", page: int = 1
+    ) -> GalleryPageInfo:
+        """Ranklist page (toplist.php). Periods map to `?tl=` values; the page
+        uses `.ptt` page-number pagination (`?p=`), parsed into `next_page`.
+
+        Ranklist rows share the compact list layout, so `parse_list_page`
+        handles the view; the rank column is ignored.
+        """
+        tl = TOPLIST_TL.get(period)
+        if tl is None:
+            raise EHException(
+                f"unknown toplist period {period!r} "
+                f"(expected one of {sorted(TOPLIST_TL)})"
+            )
+        params: dict[str, str] = {"tl": str(tl)}
+        if page > 1:
+            # OPDS `page` is 1-based (displayed page number); the upstream
+            # toplist `p` is 0-based (displayed N <-> p=N-1).
+            params["p"] = str(page - 1)
+        return await self._list_page(f"toplist:{period}:{page}", "https://e-hentai.org/toplist.php", params)
+
+    # -- favorites (write ops + categories) --------------------------------
+
+    async def favorite_action(
+        self,
+        action: str,
+        items: list[tuple[int, str]],
+        favcat: int | str | None = None,
+        note: str = "",
+    ) -> list[dict]:
+        """Proxy a favorites write op (add|move|remove) for one or many galleries.
+
+        Sequential per-item POSTs through the HTML throttle (each
+        gallerypopups form is per-gallery; batching = looping). Every item
+        reports its own ok/error so one failure never aborts the batch. On
+        any success the ``list:favorites:*`` memory cache is invalidated so
+        the OPDS favorites feed reflects the mutation immediately.
+
+        A 200 response is treated as success (same contract as the reference
+        implementation); real failure modes (sadpanda/empty body, banned,
+        403) are mapped to exceptions by the client's ``_check_failure``.
+        """
+        out: list[dict] = []
+        ok_any = False
+        for gid, token in items:
+            try:
+                async with self.throttle.acquired(KIND_HTML):
+                    await self.client.establish_session()
+                    if action == "remove":
+                        await self.client.remove_favorite(gid, token)
+                    elif action == "move":
+                        await self.client.move_favorite(gid, token, favcat, note)
+                    else:
+                        await self.client.add_favorite(gid, token, favcat, note)
+            except EHException as exc:
+                await self._trip_if_fatal(exc)
+                out.append({"gid": gid, "token": token, "ok": False, "error": str(exc)})
+                continue
+            out.append({"gid": gid, "token": token, "ok": True})
+            ok_any = True
+        if ok_any:
+            await self.mem.delete_prefix("list:favorites")
+        return out
+
+    async def favorite_categories(self) -> dict[int, str]:
+        """Favorites-category map (id -> name), memory-cached ~10min.
+
+        Read from /favorites.php (the category picker) — the same page the
+        read-only favorites feed already fetches, so no new upstream URL.
+        """
+        key = self._mem_key("favcat")
+
+        async def _fetch() -> dict[int, str]:
+            html = await self._html_get("/favorites.php")
+            return parse_favorites_categories(html)
+
+        return await self.mem.get_or_set(
+            key, _fetch, self.settings.list_cache_ttl_seconds
+        )
+
+    async def scan_favorites(
+        self,
+        known_gids: set[str],
+        *,
+        favcat_whitelist: tuple[int, ...] = (),
+        match_threshold: int = 5,
+        max_pages: int = 50,
+    ) -> dict:
+        """Fresh (uncached) incremental scan of /favorites.php.
+
+        Walks pages newest-favorited-first (``inline_set=fs_f dm_e`` forces
+        the fav-time sort and the extended layout). Stops after
+        ``match_threshold`` consecutive *scoped* galleries already present in
+        ``known_gids`` (``gid:token`` strings) or after ``max_pages`` pages.
+
+        ``favcat_whitelist`` restricts scope: empty = every gallery, otherwise
+        only galleries whose favcat id is listed. Out-of-scope galleries are
+        skipped entirely (they never count toward the stop condition).
+
+        Returns ``{"new": [...], "seen": [...], "favcat_map": {...},
+        "pages": n}`` where ``new`` are scoped galleries not in ``known`` and
+        ``seen`` is every scoped ``(gid, token)`` encountered (for state
+        persistence).
+        """
+        params = {"inline_set": "fs_f dm_e"}
+        new_items: list[GalleryListItem] = []
+        seen: list[tuple[int, str]] = []
+        favcat_map: dict[int, str] = {}
+        consecutive = 0
+        pages = 0
+        # Opaque cursor (plain gid or `gid-favoritedAt` composite for
+        # favorited-time-sorted favorites). Passed straight to `next=`.
+        next_gid: str | None = None
+
+        while pages < max_pages:
+            pages += 1
+            p = dict(params)
+            if next_gid is not None:
+                p["next"] = str(next_gid)
+            html = await self._html_get("/favorites.php", params=p)
+            info = parse_list_page(html)
+            favcat_map = info.favcat_map or favcat_map
+            if not info.galleries:
+                break
+
+            for g in info.galleries:
+                if favcat_whitelist and g.favcat not in favcat_whitelist:
+                    continue
+                key = f"{g.gid}:{g.token}"
+                seen.append((g.gid, g.token))
+                if key in known_gids:
+                    consecutive += 1
+                    if consecutive >= match_threshold:
+                        return {
+                            "new": new_items,
+                            "seen": seen,
+                            "favcat_map": favcat_map,
+                            "pages": pages,
+                        }
+                else:
+                    consecutive = 0
+                    new_items.append(g)
+
+            if info.next_gid is None:
+                break
+            next_gid = info.next_gid
+
+        return {
+            "new": new_items,
+            "seen": seen,
+            "favcat_map": favcat_map,
+            "pages": pages,
+        }
+
+    async def _html_get(self, path: str, params: dict[str, str] | None = None) -> str:
+        async with self.throttle.acquired(KIND_HTML):
+            try:
+                await self.client.establish_session()
+                if path.startswith("http://") or path.startswith("https://"):
+                    # absolute upstream URL (e.g. /s/ hrefs returned absolute)
+                    resp = await self.client.get_absolute_html(path, params=params)
+                    return resp
+                return await self.client.get_html(path, params=params)
+            except EHException as exc:
+                await self._trip_if_fatal(exc)
+                raise
+
+    async def get_mytags(self) -> dict[str, TagStyle]:
+        """Tag -> style map from the account's My Tags page (lazy TTL refresh).
+
+        Styles colour detail-document subjects (the #taglist itself has no
+        inline styles). Requires IPB login (derived, same as Watched/
+        Favorites); without it returns {} with zero upstream traffic. When
+        the cached snapshot is past TTL the map is re-fetched inline
+        (single-flight); failures keep serving the stale snapshot.
+        """
+        if not (self.settings.ipb_member_id and self.settings.ipb_pass_hash):
+            return {}
+        if not self.mytags.stale():
+            return self.mytags.get()
+        async with self.mytags.refresh_lock:
+            if not self.mytags.stale():  # refreshed while we waited
+                return self.mytags.get()
+            try:
+                page = await self._html_get("/mytags")
+                styles = parse_mytags(page)
+            except Exception as exc:  # noqa: BLE001 - cache path must not fail readers
+                logger.warning("mytags refresh failed; serving stale map: %s", exc)
+                if isinstance(exc, EHException):
+                    await self._trip_if_fatal(exc)
+                return self.mytags.get()
+            await self.mytags.replace(styles)
+            logger.info("mytags style map refreshed: %d styled tag(s)", len(styles))
+            return styles
+
+    # -- gdata metadata ----------------------------------------------------
+
+    async def get_metadata(
+        self, gid: int, token: str, *, force: bool = False
+    ) -> GalleryMetadata | None:
+        """Single-gallery gdata metadata lookup (memory-cached).
+
+        ``force=True`` bypasses the cache (used by the archive metadata
+        refresh) and re-writes it, so the next cached read sees fresh data.
+        """
+        key = self._mem_key("meta", gid, token)
+
+        async def _fetch() -> GalleryMetadata | None:
+            items = await self._gdata([(gid, token)])
+            return items[0] if items else None
+
+        if force:
+            meta = await _fetch()
+            if meta is not None:
+                await self.mem.set(key, meta, self.settings.metadata_ttl_seconds)
+            else:
+                await self.mem.delete(key)
+            return meta
+        return await self.mem.get_or_set(key, _fetch, self.settings.metadata_ttl_seconds)
+
+    async def get_metadatas(
+        self, items: list[tuple[int, str]]
+    ) -> list[GalleryMetadata]:
+        """Batch metadata lookup (max 25 gid per upstream request), cached."""
+        return await self._metadatas_impl(items)
+
+    async def _metadatas_impl(self, items: list[tuple[int, str]]) -> list[GalleryMetadata]:
+        out: list[GalleryMetadata] = []
+        to_fetch: list[tuple[int, str]] = []
+        for gid, token in items:
+            key = self._mem_key("meta", gid, token)
+            cached = await self.mem.get(key)
+            if cached is not None:
+                out.append(cached)
+            else:
+                to_fetch.append((gid, token))
+
+        for i in range(0, len(to_fetch), GDATA_BATCH_SIZE):
+            batch = to_fetch[i : i + GDATA_BATCH_SIZE]
+            for meta in await self._gdata(batch):
+                await self.mem.set(
+                    self._mem_key("meta", meta.gid, meta.token),
+                    meta,
+                    self.settings.metadata_ttl_seconds,
+                )
+                out.append(meta)
+        return out
+
+    async def _gdata(self, gidlist: list[tuple[int, str]]) -> list[GalleryMetadata]:
+        if not gidlist:
+            return []
+        payload = {
+            "method": "gdata",
+            "gidlist": [[gid, token] for gid, token in gidlist],
+            "namespace": 1,
+        }
+        async with self.throttle.acquired(KIND_API):
+            try:
+                await self.client.establish_session()
+                body = await self.client.post_api(payload)
+            except EHException as exc:
+                await self._trip_if_fatal(exc)
+                raise
+        return parse_gdata_response(body)
+
+    # -- detail pages (page-URL mapping) -----------------------------------
+
+    async def get_detail_page(
+        self, gid: int, token: str, page_index: int
+    ) -> DetailPageInfo:
+        """Detail page `page_index` (0-based); each page maps 20 images.
+
+        Cached for 1h so a single HTML request serves 20 /stream requests;
+        single-flight dedupes concurrent cold-cache misses.
+        """
+        key = self._mem_key("detail", gid, token, page_index)
+
+        async def _fetch() -> DetailPageInfo:
+            html_text = await self._html_get(
+                f"/g/{gid}/{token}/", params={"p": str(page_index)}
+            )
+            info = parse_detail_page(html_text, self.site_host, page_index)
+            # Remember the real cover (#gd1) so thumbnail proxies hit the
+            # memory cache even when the gallery was never seen on a list
+            # page (TTL matches the detail-page cache itself). The upstream
+            # #gdt block is a sprite strip in the new structure, so the
+            # detail-page cover must be recorded here, not derived from
+            # thumbnails.
+            if info.cover_url:
+                await self.mem.set(
+                    self._mem_key("cover", gid, token),
+                    info.cover_url,
+                    self.settings.page_url_ttl_seconds,
+                )
+            return info
+
+        return await self.mem.get_or_set(
+            key, _fetch, self.settings.page_url_ttl_seconds
+        )
+
+    async def resolve_image_page(
+        self, gid: int, token: str, page_no: int
+    ) -> ImagePageInfo:
+        """Resolve the real image URL for 1-based `page_no` via the /s/ page."""
+        key = self._mem_key("imgpage", gid, token, page_no)
+
+        async def _fetch() -> ImagePageInfo:
+            detail = await self.get_detail_page(
+                gid, token, (page_no - 1) // THUMBS_PER_DETAIL_PAGE
+            )
+            thumbnails = detail.thumbnails
+            idx = (page_no - 1) % THUMBS_PER_DETAIL_PAGE
+            if idx >= len(thumbnails):
+                raise PageNotFoundError(f"page {page_no} out of range for gallery {gid}")
+            href = thumbnails[idx].href
+            if not href.startswith("/s/") and not href.startswith("https://"):
+                raise EHException(f"unexpected thumbnail href {href!r}")
+            html_text = await self._html_get(href)
+            return parse_image_page(html_text)
+
+        return await self.mem.get_or_set(
+            key, _fetch, self.settings.page_url_ttl_seconds
+        )
+
+    # -- image bytes -------------------------------------------------------
+
+    async def get_image(
+        self, gid: int, token: str, page_no: int
+    ) -> tuple[bytes, str]:
+        """Return (image bytes, mime type) for stream page `page_no`.
+
+        `page_no` follows the configured PSE page base (default 1-based,
+        PSE-reader compatible; 0-based with PSE_PAGE_BASE=0). Internally
+        E-Hentai /s/ pages are always 1-based.
+
+        Source-switch retry (JHenTai ``_reParseImageUrlAndDownload`` semantics):
+        after same-URL retries (``RETRIES``) are exhausted, ``IMAGE_SOURCE_RETRIES``
+        controls how many times we invalidate the stale CDN mapping and re-resolve
+        the image URL.  Round 1 uses ``?nl={reloadKey}`` (same ``/s/`` page, new
+        hath node); round 2+ re-fetches the detail ``#gdt`` block (``detail`` cache
+        invalidated, 1 request serves 20 pages). ``gid/token`` never changes —
+        only the ephemeral ``image_url`` host is rotated.
+        """
+        from urllib.parse import urlsplit as _urlsplit
+
+        def _host(u: str) -> str:
+            try:
+                return _urlsplit(u).netloc or u
+            except Exception:
+                return u
+
+        base = self.settings.pse_page_base
+        if page_no < base:
+            raise PageNotFoundError(
+                f"page {page_no} invalid (pages start at {base})"
+            )
+        # E-Hentai /s/ pageNo is 1-based
+        page_no_1 = page_no if base == 1 else page_no + 1
+
+        # archived gallery: serve straight from the persistent zip master
+        # (long-term cache; never touches the LRU or the upstream pipeline)
+        if self.archive is not None:
+            data = await self.archive.get_page_bytes(gid, token, page_no_1)
+            if data is not None:
+                return data, detect_image_type(data)
+
+        if self.disk.enabled:
+            data = await self.disk.get(gid, token, page_no_1)
+            if data is not None:
+                return data, detect_image_type(data)
+
+        source_retries = max(0, int(getattr(self.settings, "image_source_retries", 2)))
+        imgpage_key = self._mem_key("imgpage", gid, token, page_no_1)
+        page_index = (page_no_1 - 1) // THUMBS_PER_DETAIL_PAGE
+        detail_key = self._mem_key("detail", gid, token, page_index)
+        referer = f"{self.settings.http_origin}/s/{gid}-{page_no_1}"
+
+        info: ImagePageInfo | None = None
+        last_exc: EHException | None = None
+
+        for source_attempt in range(source_retries + 1):
+            try:
+                if info is None:
+                    info = await self.resolve_image_page(gid, token, page_no_1)
+                if info.is_509:
+                    # 509 = hourly image quota exhausted. Drop the cached page-URL
+                    # mapping so a retry after the quota rolls over re-resolves
+                    # instead of serving a stale 429 for up to the 1h TTL.
+                    await self.mem.delete(imgpage_key)
+                    raise ExceedLimitError("image limit exceeded (509 placeholder)")
+
+                # --- fetch with one inline ?nl= retry before escalating to full re-resolve ---
+                try:
+                    data = await self._fetch_image_bytes(info.image_url, referer)
+                except EHException as fetch_exc:
+                    if isinstance(fetch_exc, (BannedError, ExceedLimitError, GalleryDeletedError)):
+                        raise
+                    if isinstance(fetch_exc, PageNotFoundError):
+                        raise
+                    last_exc = fetch_exc
+                    logger.warning(
+                        "image fetch failed gid=%s token=%s page=%s host=%s source_attempt=%d/%d error=%s: %s url=%s",
+                        gid, token, page_no_1, _host(info.image_url), source_attempt, source_retries,
+                        type(fetch_exc).__name__, fetch_exc, info.image_url,
+                    )
+                    # JHenTai reParse path 1: ?nl=reloadKey (same /s/ page, new CDN assignment)
+                    if info.reload_key and source_attempt == 0 and source_retries >= 1:
+                        retry_url = f"{info.image_url}?nl={info.reload_key}"
+                        logger.warning(
+                            "image source retry via nl gid=%s page=%s host=%s reloadKey=%s url=%s",
+                            gid, page_no_1, _host(info.image_url),
+                            info.reload_key[:12] if len(info.reload_key) > 12 else info.reload_key,
+                            retry_url,
+                        )
+                        try:
+                            data = await self._fetch_image_bytes(retry_url, referer)
+                        except EHException as nl_exc:
+                            if isinstance(nl_exc, (BannedError, ExceedLimitError, GalleryDeletedError)):
+                                raise
+                            if isinstance(nl_exc, PageNotFoundError):
+                                raise
+                            logger.warning(
+                                "image nl retry failed gid=%s page=%s host=%s error=%s: %s url=%s",
+                                gid, page_no_1, _host(retry_url),
+                                type(nl_exc).__name__, nl_exc, retry_url,
+                            )
+                            last_exc = nl_exc
+                            raise nl_exc
+                    else:
+                        raise fetch_exc
+
+                # Extra guard: HTML masquerading as image (defensive; client already filters)
+                mime = detect_image_type(data)
+                if mime == "application/octet-stream" and data[:2048].lstrip().startswith(b"<"):
+                    snippet = data[:512].decode(errors="ignore")
+                    if any(m in snippet for m in ("Invalid token", "Invalid request", "An error has occurred")) or "<html" in snippet.lower():
+                        raise EHServerError(
+                            f"image bytes look like HTML from host {_host(info.image_url)} ({snippet[:120]!r})",
+                            retryable=True,
+                        )
+                # Success — cache and return (text/html error pages never reach here)
+                if self.disk.enabled and mime != "application/octet-stream":
+                    await self.disk.put(gid, token, page_no_1, data)
+                elif self.disk.enabled:
+                    # Unknown type but looks like image (e.g. webp without magic) — still cache
+                    # only if not HTML
+                    if b"<html" not in data[:1024].lower():
+                        await self.disk.put(gid, token, page_no_1, data)
+                return data, mime
+
+            except EHException as exc:
+                last_exc = exc
+                if isinstance(exc, (BannedError, ExceedLimitError, GalleryDeletedError, PageNotFoundError)):
+                    raise
+                if source_attempt >= source_retries:
+                    logger.warning(
+                        "image source retries exhausted gid=%s token=%s page=%s after %d attempts last_error=%s: %s",
+                        gid, token, page_no_1, source_attempt + 1, type(exc).__name__, exc,
+                    )
+                    raise
+                # Invalidate stale CDN mappings so next iteration re-resolves to a new hath node.
+                # gid/token stays the same; only the ephemeral image_url host rotates.
+                await self.mem.delete(imgpage_key)
+                await self.mem.delete(detail_key)
+                logger.warning(
+                    "image source retry invalidating caches gid=%s token=%s page=%s attempt %d/%d -> %d host=%s reason=%s: %s",
+                    gid, token, page_no_1, source_attempt, source_retries, source_attempt + 1,
+                    _host(info.image_url) if info else "unknown", type(exc).__name__, exc,
+                )
+                info = None
+                continue
+        # Should be unreachable (loop either returns or raises); keep mypy happy.
+        if last_exc is not None:
+            raise last_exc
+        raise EHException(f"image fetch failed gid={gid} page={page_no_1}: no data")
+
+    async def _fetch_image_bytes(self, url: str, referer: str, kind: str = KIND_IMAGE) -> bytes:
+        async with self.throttle.acquired(kind):
+            try:
+                await self.client.establish_session()
+                return await self.client.fetch_image_bytes(url, referer=referer)
+            except EHException as exc:
+                await self._trip_if_fatal(exc)
+                raise
+
+    # -- thumbnails --------------------------------------------------------
+
+    async def get_thumb_url(self, gid: int, token: str) -> str:
+        """Return the thumbnail URL (for a 302 redirect from /image/...).
+
+        Browsing must not touch the gdata API: the cover URL recorded by the
+        last list-page parse is preferred; a cold miss falls back to the real
+        cover scraped from the detail page (#gd1), then to the first #gdt
+        thumbnail as a last resort. The #gdt order matters: in the new
+        (datatags=1) structure every thumbnail shares one sprite strip URL, so
+        using thumbnails[0] as the cover shows an interior-page strip at tiny
+        resolution (1 HTML request still serves 20 /stream requests).
+        """
+        cached = await self.mem.get(self._mem_key("cover", gid, token))
+        if cached:
+            return cached
+        detail = await self.get_detail_page(gid, token, 0)
+        if detail.cover_url:
+            return detail.cover_url
+        if detail.thumbnails:
+            return detail.thumbnails[0].thumb_url
+        raise EHException(f"no thumbnail found for gallery {gid}")
+
+    async def fetch_cover_bytes(self, url: str) -> tuple[bytes, str]:
+        """Fetch cover bytes from a CDN URL (e.g. a gdata thumb link).
+
+        Throttled as thumbnail traffic (the ehgt.org CDN pool). Used by the
+        archive metadata snapshot to persist a local cover copy.
+        """
+        data = await self._fetch_image_bytes(
+            url, referer=f"{self.settings.http_origin}/", kind=KIND_THUMB
+        )
+        return data, detect_image_type(data)
+
+    async def get_thumb(self, gid: int, token: str) -> tuple[bytes, str]:
+        """Proxy the gallery thumbnail, disk-cached under page_no=-1."""
+        if self.disk.enabled:
+            data = await self.disk.get(gid, token, -1)
+            if data is not None:
+                return data, detect_image_type(data)
+        url = await self.get_thumb_url(gid, token)
+        data = await self._fetch_image_bytes(
+            url, referer=f"{self.settings.http_origin}/", kind=KIND_THUMB
+        )
+        if self.disk.enabled:
+            await self.disk.put(gid, token, -1, data)
+        return data, detect_image_type(data)
+
+    # -- misc --------------------------------------------------------------
+
+    async def stats(self) -> dict:
+        out = {
+            "throttle": {
+                "html_requests": self.throttle.html_requests,
+                "api_requests": self.throttle.api_requests,
+                "image_requests": self.throttle.image_requests,
+                "thumb_requests": self.throttle.thumb_requests,
+                "circuit_open": self.throttle.circuit.is_open,
+            },
+            "memory_cache": self.mem.stats,
+            "disk_cache": self.disk.stats,
+        }
+        if self.archive is not None:
+            out["archive"] = self.archive.stats()
+        return out

@@ -1,0 +1,292 @@
+"""Typed models for E-Hentai entities.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from .languages import map_language
+
+
+@dataclass(frozen=True)
+class GalleryUrl:
+    """A gallery identified by gid + token (and which site hosts it)."""
+
+    gid: int
+    token: str
+    is_eh: bool = True
+
+    @property
+    def id_str(self) -> str:
+        return f"{self.gid}:{self.token}"
+
+
+@dataclass
+class TagStyle:
+    """Inline style of a featured (voted-up) tag, from the upstream HTML.
+
+    Values are passed through verbatim (minus `!important`); empty keys are
+    omitted when serialized to OPDS.
+    """
+
+    color: str = ""          # e.g. #f1f1f1
+    border_color: str = ""   # e.g. #048751
+    background: str = ""     # e.g. radial-gradient(#048751,#24A771)
+
+    def as_dict(self) -> dict:
+        out: dict = {}
+        if self.color:
+            out["color"] = self.color
+        if self.border_color:
+            out["borderColor"] = self.border_color
+        if self.background:
+            out["background"] = self.background
+        return out
+
+
+# HTML classes on tag divs: gt=confidence, gtl=skepticism, gtw=incorrect
+TAG_STATUS_CONFIDENCE = "confidence"
+TAG_STATUS_SKEPTICISM = "skepticism"
+TAG_STATUS_INCORRECT = "incorrect"
+
+_TAG_STATUS_BY_CLASS = {
+    "gt": TAG_STATUS_CONFIDENCE,
+    "gtl": TAG_STATUS_SKEPTICISM,
+    "gtw": TAG_STATUS_INCORRECT,
+}
+
+
+def tag_status_from_class(class_name: str) -> str:
+    return _TAG_STATUS_BY_CLASS.get(class_name, TAG_STATUS_CONFIDENCE)
+
+
+@dataclass
+class GalleryTag:
+    namespace: str
+    key: str
+    status: str = TAG_STATUS_CONFIDENCE  # confidence | skepticism | incorrect
+    style: TagStyle | None = None  # featured-tag inline style (if parsed)
+
+    def __str__(self) -> str:
+        return f"{self.namespace}:{self.key}"
+
+
+@dataclass
+class GalleryImage:
+    """An image URL plus optional geometry (used for covers, thumbs, pages)."""
+
+    url: str
+    height: float | None = None
+    width: float | None = None
+    reload_key: str | None = None  # nl() reloadKey for failed image loads
+
+
+@dataclass
+class GalleryThumbnail:
+    """One entry in a detail page's #gdt thumbnail block."""
+
+    href: str  # /s/{imageToken}/{gid}-{pageNo} or /mpv/... URL
+    thumb_url: str
+    page_no: int | None  # 1-based page number, derived from href when possible
+    is_large: bool = False
+    origin_image_hash: str | None = None  # 40-char orghash from new structure
+    width: float = 0.0
+    height: float = 0.0
+
+
+@dataclass
+class GalleryMetadata:
+    """Result of the gdata API (`gmetadata` entry)."""
+
+    gid: int
+    token: str
+    title: str
+    title_jpn: str
+    category: str
+    thumb: str
+    rating: float
+    tags: dict[str, list[GalleryTag]]
+    filecount: int
+    filesize: int
+    posted: int  # unix seconds
+    uploader: str
+    torrentcount: int
+    expunged: bool
+
+    @property
+    def language(self) -> str:
+        """First language tag mapped to BCP 47 (RFC 5646); "" when none maps.
+
+        Marker pseudo-tags and unknown keys are dropped — the raw tag text
+        stays in the detail document's `subject`.
+        """
+        for tag in self.tags.get("language") or []:
+            mapped = map_language(tag.key)
+            if mapped:
+                return mapped
+        return ""
+
+    @property
+    def size_human(self) -> str:
+        """Human-readable file size: B/KB/MB/GB."""
+        size = float(self.filesize)
+        if size < 1024:
+            return f"{int(size)}B"
+        size /= 1024
+        if size < 1024:
+            return f"{size:.2f}KB"
+        size /= 1024
+        if size < 1024:
+            return f"{size:.2f}MB"
+        size /= 1024
+        return f"{size:.2f}GB"
+
+
+@dataclass
+class GalleryComment:
+    """One gallery comment parsed from the detail page's `#cdiv` block.
+
+    Only the display-relevant subset is kept — interactive flags (fromMe/
+    votedUp/votedDown) and score details are deliberately dropped (MVP).
+    Content is preserved as raw HTML (clients render it).
+    """
+
+    id: int
+    username: str
+    user_id: int | None = None  # from the forums showuser= link
+    time: str = ""  # site-local "yyyy-MM-dd HH:mm"
+    last_edit_time: str = ""  # from .c8 > strong (empty when unedited)
+    content_html: str = ""  # raw HTML of .c6 (client renders)
+
+
+@dataclass
+class GalleryListItem:
+    """A gallery entry parsed from a list page (gid/token/title/cover/category)."""
+
+    gid: int
+    token: str
+    title: str
+    category: str
+    cover_url: str
+    page_count: int | None = None
+    rating: float = 0.0
+    publish_time: str = ""
+    language: str = ""  # from list-page tags (empty when layout lacks tags)
+    is_expunged: bool = False
+    # Favorites category id the gallery sits in (from the favorites page's
+    # posted-element title attr; None on non-favorites pages or when the
+    # lookup fails — graceful degradation, never raises).
+    favcat: int | None = None
+    # Tags parsed from the list page (layout dependent: compact/extended carry
+    # the full set, thumbnail only featured tags, minimal none). Featured tags
+    # carry `style`; non-featured tags have style=None.
+    tags: list[GalleryTag] = field(default_factory=list)
+
+
+@dataclass
+class GalleryPageInfo:
+    """Parsed list page: entries + pagination info.
+
+    Two pagination styles coexist: `next_gid` (front-page `next=` lastGid
+    pagination) and `next_page` (`.ptt` page-number pagination, used by
+    ranklist/toplist pages which have no `#unext`). Only one is set for a
+    given page.
+    """
+
+    galleries: list[GalleryListItem] = field(default_factory=list)
+    # Opaque lastGid pagination cursor: a plain gid ("2367467") or a composite
+    # ``gid-favoritedAt`` cursor ("2753175-1786365950", /favorites.php sorted by
+    # favorited time). Kept as a raw string — never int()-coerced — and passed
+    # through verbatim to the upstream `next=`/`prev=` parameter.
+    next_gid: str | None = None
+    prev_gid: str | None = None
+    total_count: int | None = None
+    next_page: int | None = None  # .ptt page-number pagination (toplist)
+    # Favorites-category map id -> name, parsed only on /favorites.php pages
+    # (empty on every other list type).
+    favcat_map: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass
+class DetailPageInfo:
+    """Parsed detail page: thumbnail URLs + page range info.
+
+    Also carries the gallery metadata scraped from the same HTML page
+    (#gn/#gj/#gdd/#gdn/#grt2...) so the detail OPDS document needs no gdata:
+    the detail page is already fetched by /stream anyway (1 req serves 20).
+    """
+
+    image_no_from: int  # 0-based inclusive
+    image_no_to: int    # 0-based inclusive
+    image_count: int
+    current_page_no: int
+    page_count: int  # number of thumbnail pages (ceil(filecount/20))
+    thumbnails: list[GalleryThumbnail] = field(default_factory=list)
+    # Full tag list from the #taglist block (all tags, with status + style).
+    tags: list[GalleryTag] = field(default_factory=list)
+    # --- metadata scraped from the same page ---
+    title: str = ""          # #gn
+    title_jpn: str = ""      # #gj (empty when no Japanese title)
+    category: str = ""       # #gdc > .cs
+    cover_url: str = ""      # #gd1 > div style url(...)
+    rating: float = 0.0      # #rating_image.ir sprite
+    uploader: str = ""       # #gdn > a
+    publish_time: str = ""   # #gdd Posted row
+    language: str = ""       # #gdd Language row (mapped to BCP 47, RFC 5646)
+    filesize_text: str = ""  # #gdd File Size row (e.g. "189.3 MiB")
+    torrent_count: int = 0   # #gd5 torrent link count
+    expunged: bool = False   # any #gdd value contains "Expunged"
+    # Comments from the #cdiv block (latest batch visible on this page).
+    comments: list[GalleryComment] = field(default_factory=list)
+
+
+@dataclass
+class ImagePageInfo:
+    """Parsed /s/ image page."""
+
+    image_url: str
+    width: float | None = None
+    height: float | None = None
+    reload_key: str | None = None
+    is_509: bool = False
+
+
+@dataclass
+class ArchiveOption:
+    """One archive tier offered by the archiver page (real markup).
+
+    ``or_value`` is the form's ``dltype`` value (org/res/...); ``label`` is
+    the submit-button text minus the leading "Download " (e.g. "Original
+    Archive"); ``dlcheck`` is the full submit-button value sent back on POST.
+    ``gp_price`` is parsed from the adjacent "Download Cost" row (Free -> 0,
+    "315,000 GP" -> 315000). ``unlocked`` is true when the page shows the
+    "You unlocked ... download of this archive" row for this tier (already
+    paid for / free — POST then only re-triggers the download).
+    """
+
+    or_value: str  # dltype: org | res | ...
+    label: str = ""
+    dlcheck: str = ""  # submit value: "Download Original Archive"
+    gp_price: int = 0
+    size: str = ""  # "Estimated Size" row, e.g. "1.06 GiB"
+    available: bool = True  # False when the submit button is disabled
+    unlocked: bool = False
+
+
+@dataclass
+class ArchiverPageInfo:
+    """Parsed archiver.php page: tiers + download progress.
+
+    ``download_state``: ``""`` (tier page), ``"preparing"`` (archive is being
+    prepared upstream; ``download_url`` carries the hath.network status URL)
+    or ``"ready"`` (``download_url`` carries the final ``?start=1`` link).
+    ``error`` carries a page-level message (non-member / gallery cannot be
+    archived) — the manager maps it to exceptions.
+    """
+
+    title: str = ""
+    options: list[ArchiveOption] = field(default_factory=list)
+    download_state: str = ""  # "" | "preparing" | "ready"
+    download_url: str = ""  # absolute; preparing/status URL or final download
+    error: str = ""
+    gp_balance: int = 0

@@ -1,0 +1,47 @@
+PandaOPDS THIRD-PARTY NOTICES
+=============================
+
+This distribution contains material derived from the following third-party
+open-source project:
+
+1. JHenTai
+   Source: https://github.com/jiangtian616/JHenTai
+   License: Apache License 2.0
+   Copyright: JHenTai contributors
+
+   The E-Hentai / ExHentai scraping and parsing implementation in this
+   repository (app/eh/) is a Python rewrite that follows JHenTai's HTML
+   selectors, page-URL conventions, session/cookie handling, uconfig
+   profile management and upstream failure-detection heuristics.
+
+   In accordance with Apache License 2.0 §4, this notice preserves the
+   above attribution; files derived from JHenTai's implementation are
+   identified in the source where applicable.  No part of JHenTai's
+   original source code is redistributed verbatim in this repository.
+
+The full text of the Apache License 2.0, which governs both this project
+and the JHenTai-derived material above, is reproduced in the repository:
+
+- LICENSE                (this project's license)
+- example/JHenTai/LICENSE (upstream's copy, read-only reference)
+
+2. EhTagTranslation Database
+   Source: https://github.com/EhTagTranslation/Database
+   License: Creative Commons Attribution-NonCommercial-ShareAlike 3.0
+            Mainland China (CC BY-NC-SA 3.0 CN)
+   Copyright: EhTagTranslation contributors
+
+   The Chinese tag translations used by the optional tag-translation
+   feature (TAG_TRANSLATION_ENABLED; app/eh/tag_translation.py) come from
+   this community-maintained dictionary. The database is fetched at
+   runtime from the project's GitHub releases and is NOT redistributed
+   with this repository. Translated tag names rendered in OPDS feeds and
+   search rewriting are derived from that data.
+
+   The CC BY-NC-SA 3.0 CN license requires attribution (this notice),
+   prohibits commercial use, and applies share-alike terms to derivative
+   works of the database itself. This project is for personal,
+   non-commercial use only.
+
+   Upstream license text:
+   https://raw.githubusercontent.com/EhTagTranslation/Database/master/LICENSE.md

@@ -1,0 +1,59 @@
+# PandaOPDS — out-of-the-box deployment.
+#
+# Uses the prebuilt multi-arch image (linux/amd64 + linux/arm64) published to
+# ghcr.io by .github/workflows/docker-publish.yml. No local build required:
+#   docker compose up -d      # pull prebuilt image and start (auto-pulls if missing)
+#   docker compose pull       # update to the latest published image
+#
+# Developers / offline (ghcr unreachable) builds:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# Configuration:
+#
+#   Batch pass-through: every variable documented in .env.example is injected
+#   from the env file below (default: .env in this directory) when present.
+#   Editing .env is the single place to configure — no per-key mapping needed.
+#   Missing/empty .env is fine: the service then starts on defaults (public
+#   content only, mirror ENV presets, environment defaults below).
+#
+#   Custom env file path (both flags must point at the same file so the
+#   ${VAR} interpolation in `environment:` reads the same values as `env_file`):
+#     PANDAPDS_ENV_FILE=/path/mine.env docker compose --env-file=/path/mine.env up -d
+
+services:
+  pandaopds:
+    image: ghcr.io/niatsysor/pandaopds:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"   # bind to loopback; expose via reverse proxy
+    env_file:
+      # required: false → a missing env file is not an error (service starts
+      # on defaults); present file is injected batch-wise.
+      - path: ${PANDAPDS_ENV_FILE:-.env}
+        required: false
+    environment:
+      # --- container paths (must point at the mounted volumes; the
+      #     relative-path defaults in .env.example don't apply in-container) ---
+      CACHE_DIR: /data/cache
+      ARCHIVE_DIR: /data/archives
+      # --- deployment-level switches (.env may override; defaults shown here) ---
+      OPDS_ACQ_DETAIL: ${OPDS_ACQ_DETAIL:-false}   # false=acquisition→image stream; true=→detail doc
+      FAVORITES_SYNC_ARCHIVE: ${FAVORITES_SYNC_ARCHIVE:-0}      # auto-archive new favorites (GP cost!)
+      # --- throttling (ban-avoidance) ---
+      # Recommended values are conservative: safe for multi-client / server
+      # deployments (single IP aggregating all clients' traffic). For a
+      # single-user self-hosted setup you can safely try the hotter app
+      # defaults instead: HTML_INTERVAL_SECONDS=0.3 and MAX_CONCURRENCY=5
+      # (set them in .env). IMAGE/THUMB concurrency are identical either way.
+      HTML_INTERVAL_SECONDS: ${HTML_INTERVAL_SECONDS:-1.5}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-2}
+      IMAGE_MAX_CONCURRENCY: ${IMAGE_MAX_CONCURRENCY:-5}
+      THUMB_MAX_CONCURRENCY: ${THUMB_MAX_CONCURRENCY:-25}
+    volumes:
+      - cache-data:/data/cache
+      - archive-data:/data/archives   # persistent GP archive masters
+      - ./config:/config          # home.toml lives here
+
+volumes:
+  cache-data:
+  archive-data:
