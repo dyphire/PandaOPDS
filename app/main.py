@@ -21,6 +21,7 @@ from .eh.exceptions import EHException
 from .eh.service import EHService
 from .eh.tag_translation import TagTranslator
 from .favorites.router import router as favorites_router
+from .rating.router import router as rating_router
 from .favorites.state import FavoritesSyncState
 from .favorites.sync import FavoritesSyncer
 from .opds.router import router as opds_router
@@ -152,6 +153,7 @@ app.include_router(opds2_router)
 app.include_router(stream_router)
 app.include_router(archive_router)
 app.include_router(favorites_router)
+app.include_router(rating_router)
 app.include_router(webui_router)
 
 

@@ -7,6 +7,7 @@ Pipeline for one image: page-URL cache -> detail page (1 req / 20 pages)
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import replace
@@ -25,6 +26,7 @@ from .exceptions import (
     ExceedLimitError,
     GalleryDeletedError,
     PageNotFoundError,
+    ParseError,
 )
 from .models import (
     DetailPageInfo,
@@ -593,6 +595,52 @@ class EHService:
                 await self._trip_if_fatal(exc)
                 raise
         return parse_gdata_response(body)
+
+    async def rate_gallery(self, gid: int, token: str, rating: float) -> dict:
+        """Submit a rating using a fresh apikey scraped from the gallery page."""
+        for attempt in range(2):
+            page = await self._html_get(f"/g/{gid}/{token}/")
+            match = re.search(r'\bvar\s+apikey\s*=\s*["\']([\w-]+)["\']', page)
+            if not match:
+                raise ParseError("gallery detail page has no rating apikey")
+            payload = {
+                "method": "rategallery", "apikey": match.group(1),
+                "apiuid": int(self.settings.ipb_member_id), "gid": gid,
+                "token": token, "rating": int(rating * 2),
+            }
+            async with self.throttle.acquired(KIND_API):
+                try:
+                    await self.client.establish_session()
+                    raw = await self.client.post_api(payload)
+                except EHException as exc:
+                    await self._trip_if_fatal(exc)
+                    raise
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError):
+                data = {}
+            expected = ("rating_usr", "rating_avg", "rating_cnt")
+            parsed_success = False
+            if isinstance(data, dict) and all(k in data for k in expected):
+                try:
+                    result = {
+                        "rating_usr": float(data["rating_usr"]),
+                        "rating_avg": float(data["rating_avg"]),
+                        "rating_cnt": int(data["rating_cnt"]),
+                    }
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    parsed_success = True
+                    return result
+            error = str(data.get("error", "")) if isinstance(data, dict) else ""
+            rejected = bool(re.search(r"\bapi[\s_-]*key\b", error, re.IGNORECASE))
+            # A response without the three success fields may mean a stale
+            # key (including an explicit key rejection); refresh once.
+            if attempt == 0 and (rejected or not parsed_success):
+                continue
+            raise ParseError(error or "rating response is missing expected fields")
+        raise AssertionError("unreachable")
 
     # -- detail pages (page-URL mapping) -----------------------------------
 
