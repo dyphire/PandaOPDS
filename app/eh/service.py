@@ -180,6 +180,8 @@ class EHService:
                 enabled=settings.image_cache_enabled,
             )
         )
+        self._thumbnail_source_flights: dict[str, asyncio.Task[bytes]] = {}
+        self._thumbnail_source_flights_lock = asyncio.Lock()
         self.site_host = settings.site_host
         # Optional archive manager (injected by main): when set, /stream serves
         # pages straight from the persistent zip master before touching the
@@ -935,6 +937,52 @@ class EHService:
                 await self._trip_if_fatal(exc)
                 raise
 
+    async def _forget_thumbnail_source_flight(
+        self, url: str, task: asyncio.Task[bytes]
+    ) -> None:
+        async with self._thumbnail_source_flights_lock:
+            if self._thumbnail_source_flights.get(url) is task:
+                self._thumbnail_source_flights.pop(url, None)
+
+    def _thumbnail_source_flight_done(
+        self, url: str, task: asyncio.Task[bytes]
+    ) -> None:
+        # Consume failures even if every requesting client disconnected while
+        # the shared fetch was running. Awaiters can still observe the result.
+        if not task.cancelled():
+            task.exception()
+        asyncio.create_task(self._forget_thumbnail_source_flight(url, task))
+
+    async def _get_thumbnail_source(self, url: str, referer: str) -> bytes:
+        """Fetch one source image per URL while concurrent page requests wait."""
+        async def _load() -> bytes:
+            source = (
+                await self.disk.get_named("thumb-url", url)
+                if self.disk.enabled
+                else None
+            )
+            if source is None:
+                source = await self._fetch_image_bytes(
+                    url, referer=referer, kind=KIND_THUMB
+                )
+                if self.disk.enabled:
+                    await self.disk.put_named("thumb-url", url, source)
+            return source
+
+        async with self._thumbnail_source_flights_lock:
+            task = self._thumbnail_source_flights.get(url)
+            if task is None:
+                task = asyncio.create_task(_load())
+                self._thumbnail_source_flights[url] = task
+                task.add_done_callback(
+                    lambda completed: self._thumbnail_source_flight_done(
+                        url, completed
+                    )
+                )
+        # A client disconnect should not cancel the shared upstream request
+        # needed by the other page requests in this flight.
+        return await asyncio.shield(task)
+
     # -- thumbnails --------------------------------------------------------
 
     async def get_thumb_url(self, gid: int, token: str) -> str:
@@ -1047,19 +1095,10 @@ class EHService:
         if width > 2000 or height > 2000:
             raise EHException("thumbnail dimensions are missing or unsafe")
 
-        source = (
-            await self.disk.get_named("thumb-url", thumb.thumb_url)
-            if self.disk.enabled
-            else None
+        source = await self._get_thumbnail_source(
+            thumb.thumb_url,
+            referer=f"{self.settings.http_origin}/g/{gid}/{token}/",
         )
-        if source is None:
-            source = await self._fetch_image_bytes(
-                thumb.thumb_url,
-                referer=f"{self.settings.http_origin}/g/{gid}/{token}/",
-                kind=KIND_THUMB,
-            )
-            if self.disk.enabled:
-                await self.disk.put_named("thumb-url", thumb.thumb_url, source)
 
         try:
             crop_box = None
