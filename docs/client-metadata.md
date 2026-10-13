@@ -286,13 +286,22 @@ OPDS 2.0 将视觉表现（封面/缩略图）放在顶层 `images` 集合。**�
   ],
   "images": [{ "href": "/image/{gid}/{token}/thumb", "type": "image/jpeg" }],
   "readingOrder": [
-    { "href": "/stream/{gid}/{token}/page/1", "type": "image/jpeg" },
+    {
+      "href": "/stream/{gid}/{token}/page/1",
+      "type": "image/jpeg",
+      "properties": {
+        "x:thumbnail": {
+          "href": "/image/{gid}/{token}/page/1/thumb",
+          "type": "image/jpeg"
+        }
+      }
+    },
     …共页数条（默认 1-based，`PSE_PAGE_BASE=0` 时从 0 起）…
   ]
 }
 ```
 
-- **`readingOrder`**：RWPM 逐页图片 URL 列表——Stump 的 Stream 阅读器据此逐页拉图（零额外查询）。
+- **`readingOrder`**：RWPM 逐页图片 URL 列表——Stump 的 Stream 阅读器据此逐页拉图（零额外查询）。每项的 `properties["x:thumbnail"]` 是该页预览对象，含 `href` 与 `type`；`href` 指向 `/image/{gid}/{token}/page/{page}/thumb`，服务端从详情页缩略图中裁切拼接图或代理独立缩略图，统一输出 JPEG。无法确认裁切边界时预览端点返回错误，不会把整条拼接图当成单页图返回。顶层 `images[]` 仍只表示图库封面。
 - `metadata.author`（RWPM 单数）与 `authors` 并存（Stump/Readium 只认 `author`）。
 - 图库不存在 → 404。
 

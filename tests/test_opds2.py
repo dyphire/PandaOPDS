@@ -234,8 +234,20 @@ def test_publication_detail_document_never_self_referencing():
         # URLs) so stream readers (Stump Divina) paginate without lookups
         order = pub["readingOrder"]
         assert len(order) == 42
-        assert order[0] == {"href": "/stream/123/abc/page/1", "type": "image/jpeg"}
-        assert order[-1] == {"href": "/stream/123/abc/page/42", "type": "image/jpeg"}
+        assert order[0] == {
+            "href": "/stream/123/abc/page/1",
+            "type": "image/jpeg",
+            "properties": {
+                "x:thumbnail": {
+                    "href": "/image/123/abc/page/1/thumb",
+                    "type": "image/jpeg",
+                }
+            },
+        }
+        assert order[-1]["href"] == "/stream/123/abc/page/42"
+        assert order[-1]["properties"]["x:thumbnail"]["href"] == (
+            "/image/123/abc/page/42/thumb"
+        )
         assert all(link["type"] == "image/jpeg" for link in order)
         assert "alternate" in links
 

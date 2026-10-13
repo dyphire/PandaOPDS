@@ -804,6 +804,7 @@ def _parse_new_thumbnails(root: Any, site_host: str) -> list[GalleryThumbnail]:
         is_large = re.search(r"\)\s*-?\d+px", style) is None
         wm = re.search(r"width:\s*(\d+)px", style)
         hm = re.search(r"height:\s*(\d+)px", style)
+        background_x, background_y = _background_position(style, m.end())
 
         page_no: int | None = None
         sm = _S_PAGE_HREF_RE.search(href)
@@ -821,6 +822,8 @@ def _parse_new_thumbnails(root: Any, site_host: str) -> list[GalleryThumbnail]:
                 origin_image_hash=origin_hash,
                 width=float(wm.group(1)) if wm else 0.0,
                 height=float(hm.group(1)) if hm else 0.0,
+                background_x=background_x,
+                background_y=background_y,
             )
         )
     return out
@@ -848,6 +851,7 @@ def _parse_old_small_thumbnails(root: Any, site_host: str) -> list[GalleryThumbn
             page_no = int(sm.group(3))
         wm = re.search(r"width:\s*(\d+)px", style)
         hm = re.search(r"height:\s*(\d+)px", style)
+        background_x, background_y = _background_position(style, m.end())
         out.append(
             GalleryThumbnail(
                 href=href,
@@ -855,9 +859,56 @@ def _parse_old_small_thumbnails(root: Any, site_host: str) -> list[GalleryThumbn
                 page_no=page_no,
                 width=float(wm.group(1)) if wm else 0.0,
                 height=float(hm.group(1)) if hm else 0.0,
+                background_x=background_x,
+                background_y=background_y,
             )
         )
     return out
+
+
+def _background_position(style: str, url_end: int) -> tuple[float | None, float | None]:
+    """Return explicit CSS background offsets following url(), if present."""
+    if re.search(r"\bbackground-size\s*:", style, re.IGNORECASE):
+        return None, None
+    tail = style[url_end:]
+    position = re.search(
+        r"\s+(-?(?:\d+(?:\.\d+)?px|0))(?:\s+(-?(?:\d+(?:\.\d+)?px|0)))?\s+no-repeat\b",
+        tail,
+        re.IGNORECASE,
+    )
+    if not position:
+        return None, None
+
+    def _pixels(value: str | None) -> float:
+        if not value:
+            return 0.0
+        return float(value.lower().removesuffix("px"))
+
+    return _pixels(position.group(1)), _pixels(position.group(2))
+
+
+def _classify_thumbnail_backgrounds(thumbnails: list[GalleryThumbnail]) -> None:
+    """Classify backgrounds using all #gdt entries, never a single tile guess."""
+    by_url: dict[str, list[GalleryThumbnail]] = {}
+    for thumb in thumbnails:
+        by_url.setdefault(thumb.thumb_url, []).append(thumb)
+
+    for group in by_url.values():
+        if len(group) == 1:
+            thumb = group[0]
+            # A single background with explicit coordinates is not enough to
+            # prove a sprite, while a unique ordinary background is standalone.
+            thumb.is_sprite = False if thumb.background_x is None else None
+            continue
+        positions = [(t.background_x, t.background_y) for t in group]
+        known = all(x is not None and y is not None for x, y in positions)
+        distinct = len(set(positions)) == len(positions)
+        dimensions = all(t.width > 0 and t.height > 0 for t in group)
+        # Shared URL, complete distinct pixel offsets, and tile dimensions are
+        # required before cropping. Anything else remains explicitly uncertain.
+        classification = bool(known and distinct and dimensions)
+        for thumb in group:
+            thumb.is_sprite = classification if classification else None
 
 
 def _parse_old_large_thumbnails(root: Any, site_host: str) -> list[GalleryThumbnail]:
@@ -874,9 +925,17 @@ def _parse_old_large_thumbnails(root: Any, site_host: str) -> list[GalleryThumbn
         sm = _S_PAGE_HREF_RE.search(href)
         if sm:
             page_no = int(sm.group(3))
-        out.append(
-            GalleryThumbnail(href=href, thumb_url=thumb_url, page_no=page_no, is_large=True)
-        )
+        wm = re.search(r"\d+", _attr(img, "width"))
+        hm = re.search(r"\d+", _attr(img, "height"))
+        out.append(GalleryThumbnail(
+            href=href,
+            thumb_url=thumb_url,
+            page_no=page_no,
+            is_large=True,
+            width=float(wm.group()) if wm else 0.0,
+            height=float(hm.group()) if hm else 0.0,
+            is_sprite=False,
+        ))
     return out
 
 
@@ -900,6 +959,8 @@ def parse_detail_page(html_text: str, site_host: str, page_index: int = 0) -> De
             thumbnails = _parse_old_small_thumbnails(gdt, site_host)
         else:
             thumbnails = _parse_old_large_thumbnails(gdt, site_host)
+
+    _classify_thumbnail_backgrounds(thumbnails)
 
     # Assign page numbers for any entry missing one (MPV/new-structure case)
     # and rewrite MPV hrefs to /s/ URLs using orghash[:10].

@@ -7,9 +7,11 @@ Pipeline for one image: page-URL cache -> detail page (1 req / 20 pages)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from io import BytesIO
 from dataclasses import replace
 from typing import Awaitable, Callable
 
@@ -62,6 +64,37 @@ _EH_CATEGORY_MASKS = {
     "asian porn": 511,
 }
 _CATEGORY_TOKEN_RE = re.compile(r'([^\s"]+:"[^"]*"|"[^"]*"|\S+)')
+
+
+def _render_page_thumbnail(
+    source: bytes,
+    max_size: tuple[int, int],
+    crop_box: tuple[int, int, int, int] | None = None,
+) -> bytes:
+    """Decode and encode a page preview off the event loop as a JPEG."""
+    from PIL import Image
+
+    with Image.open(BytesIO(source)) as image:
+        image.load()
+        if crop_box is not None:
+            left, top, right, bottom = crop_box
+            if (
+                left < 0
+                or top < 0
+                or right > image.width
+                or bottom > image.height
+            ):
+                raise ValueError("sprite crop is outside source image bounds")
+            image = image.crop(crop_box)
+        else:
+            image.thumbnail(max_size, Image.Resampling.LANCZOS)
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        elif image.mode == "L":
+            image = image.convert("RGB")
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=88, optimize=True)
+        return output.getvalue()
 
 
 def _extract_category_keywords(
@@ -958,6 +991,94 @@ class EHService:
         if self.disk.enabled:
             await self.disk.put(gid, token, -1, data)
         return data, detect_image_type(data)
+
+    async def get_page_thumbnail(self, gid: int, token: str, page_no: int) -> tuple[bytes, str]:
+        """Return a JPEG preview for one page, cropping only proven sprites."""
+        base = self.settings.pse_page_base
+        if page_no < base:
+            raise PageNotFoundError(f"page {page_no} invalid (pages start at {base})")
+        page_no_1 = page_no if base == 1 else page_no + 1
+        cache_page = -(page_no_1 + 1)  # -1 is reserved for the gallery cover.
+        if self.disk.enabled:
+            cached = await self.disk.get(gid, token, cache_page)
+            if cached is not None:
+                return cached, "image/jpeg"
+
+        # A ready local archive is authoritative and remains readable after
+        # the source gallery disappears. Its pages can provide previews even
+        # when the upstream #gdt page is no longer available.
+        if self.archive is not None and self.archive.is_ready(gid, token):
+            try:
+                page_bytes, _ = await self.get_image(gid, token, page_no)
+                result = await asyncio.to_thread(
+                    _render_page_thumbnail, page_bytes, (400, 400)
+                )
+                if self.disk.enabled:
+                    await self.disk.put(gid, token, cache_page, result)
+                return result, "image/jpeg"
+            except Exception as exc:  # noqa: BLE001 - try the online preview path
+                logger.warning(
+                    "archive page thumbnail failed gid=%s page=%s: %s",
+                    gid, page_no_1, exc,
+                )
+
+        detail = await self.get_detail_page(
+            gid, token, (page_no_1 - 1) // THUMBS_PER_DETAIL_PAGE
+        )
+        index = (page_no_1 - 1) % THUMBS_PER_DETAIL_PAGE
+        if index >= len(detail.thumbnails):
+            raise PageNotFoundError(f"page {page_no_1} out of range for gallery {gid}")
+        thumb = detail.thumbnails[index]
+        width, height = round(thumb.width), round(thumb.height)
+        has_pixel_geometry = (
+            thumb.background_x is not None
+            and thumb.background_y is not None
+            and thumb.background_x.is_integer()
+            and thumb.background_y.is_integer()
+            and width > 0
+            and height > 0
+        )
+        if thumb.is_sprite and not has_pixel_geometry:
+            raise EHException("sprite thumbnail dimensions or offsets are missing")
+        if thumb.is_sprite is None and not has_pixel_geometry:
+            raise EHException("thumbnail layout is ambiguous; preview omitted")
+        if not thumb.is_sprite and (width <= 0 or height <= 0):
+            width = height = 400
+        if width > 2000 or height > 2000:
+            raise EHException("thumbnail dimensions are missing or unsafe")
+
+        source = (
+            await self.disk.get_named("thumb-url", thumb.thumb_url)
+            if self.disk.enabled
+            else None
+        )
+        if source is None:
+            source = await self._fetch_image_bytes(
+                thumb.thumb_url,
+                referer=f"{self.settings.http_origin}/g/{gid}/{token}/",
+                kind=KIND_THUMB,
+            )
+            if self.disk.enabled:
+                await self.disk.put_named("thumb-url", thumb.thumb_url, source)
+
+        try:
+            crop_box = None
+            if has_pixel_geometry:
+                left = round(-thumb.background_x)
+                top = round(-thumb.background_y)
+                crop_box = (left, top, left + width, top + height)
+            result = await asyncio.to_thread(
+                _render_page_thumbnail,
+                source,
+                (width, height),
+                crop_box,
+            )
+        except Exception as exc:  # Pillow format/decoder/geometry failure
+            raise EHException(f"cannot decode page thumbnail: {exc}") from exc
+
+        if self.disk.enabled:
+            await self.disk.put(gid, token, cache_page, result)
+        return result, "image/jpeg"
 
     # -- misc --------------------------------------------------------------
 

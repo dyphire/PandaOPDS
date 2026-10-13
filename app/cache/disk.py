@@ -67,7 +67,8 @@ class DiskImageCache:
                     size = path.stat().st_size
                 except OSError:
                     continue
-                key = path.name
+                # _path_for shards the SHA-256 key as first-two/rest.
+                key = path.parent.name + path.name
                 self._entries[key] = (str(path), size, path.stat().st_mtime)
                 self._total_bytes += size
         # expire old files
@@ -82,6 +83,10 @@ class DiskImageCache:
     @staticmethod
     def _key(gid: int, token: str, page_no: int) -> str:
         return hashlib.sha256(f"{gid}:{token}:{page_no}".encode()).hexdigest()
+
+    @staticmethod
+    def _named_key(namespace: str, value: str) -> str:
+        return hashlib.sha256(f"{namespace}:{value}".encode()).hexdigest()
 
     def _path_for(self, key: str) -> Path:
         return self.cache_dir / key[:2] / key[2:]
@@ -132,6 +137,52 @@ class DiskImageCache:
             self._entries[key] = (str(path), len(data), now)
             self._total_bytes += len(data)
             self._evict_if_needed()
+
+    async def get_named(self, namespace: str, value: str) -> bytes | None:
+        """Read an LRU entry addressed by a non-gallery key (e.g. sprite URL)."""
+        if not self.enabled:
+            return None
+        key = self._named_key(namespace, value)
+        async with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self._misses += 1
+                return None
+            path, size, mtime = entry
+            if time.time() - mtime > self.ttl:
+                self._remove_entry(key, path, size)
+                self._misses += 1
+                return None
+            try:
+                data = await asyncio.to_thread(Path(path).read_bytes)
+            except OSError:
+                self._misses += 1
+                return None
+            try:
+                os.utime(path)
+                self._entries[key] = (path, size, time.time())
+            except OSError:
+                pass
+            self._hits += 1
+            return data
+
+    async def put_named(self, namespace: str, value: str, data: bytes) -> Path:
+        """Write a non-gallery-keyed entry into the same bounded disk LRU."""
+        if not self.enabled:
+            return self._path_for(self._named_key(namespace, value))
+        key = self._named_key(namespace, value)
+        path = self._path_for(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            await asyncio.to_thread(path.write_bytes, data)
+            now = time.time()
+            old = self._entries.get(key)
+            if old is not None:
+                self._total_bytes -= old[1]
+            self._entries[key] = (str(path), len(data), now)
+            self._total_bytes += len(data)
+            self._evict_if_needed()
+        return path
 
     def _remove_entry(self, key: str, path: str, size: int) -> None:
         self._entries.pop(key, None)

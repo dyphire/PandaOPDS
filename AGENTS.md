@@ -173,6 +173,7 @@ E-Hentai 官方 archiver 服务：登录 + 星会员 + GP。PandaOPDS 通过 Web
 | `GET /opds/v1.2/gallery/{gid}/{token}/chapters` | 图库详情 feed（单章节条目 + PSE stream link） |
 | `GET /stream/{gid}/{token}/page/{n}` | 图片代理流（默认 1-based，`PSE_PAGE_BASE=0` 时 0-based，返回 image/jpeg；v1.2/v2.0 共用） |
 | `GET /image/{gid}/{token}/thumb` | 缩略图代理（共用） |
+| `GET /image/{gid}/{token}/page/{n}/thumb` | 内页预览代理（JPEG）：共享 `#gdt` 拼接图按 CSS 像素偏移裁切，独立缩略图直接处理；无法确认边界时失败关闭。OPDS 2.0 详情 publication 的 `readingOrder[].properties["x:thumbnail"]` 指向此端点 |
 | `GET /image/fetch?url=` | 评论封面/预览图代理（v2.0 `x:reviews` 同源化，规避 WebView CORS；URL 视为不透明不解析 gid；host 白名单 `IMAGE_PROXY_HOSTS`，默认 `ehgt.org,s.exhentai.org`，强制 https；WebView 无法携带认证头时可配 `AUTH_EXEMPT_PATHS=/image/fetch` 豁免） |
 
 **OPDS 2.0（JSON，`app/opds2/`）**

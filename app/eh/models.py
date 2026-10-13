@@ -102,6 +102,9 @@ class GalleryThumbnail:
     origin_image_hash: str | None = None  # 40-char orghash from new structure
     width: float = 0.0
     height: float = 0.0
+    background_x: float | None = None  # CSS background-position x in pixels
+    background_y: float | None = None  # CSS background-position y in pixels
+    is_sprite: bool | None = None  # whole #gdt classification; None means uncertain
 
 
 @dataclass

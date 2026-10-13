@@ -391,6 +391,17 @@ class Opds2Builder:
         """
         base = self.settings.pse_page_base
         return [
-            {"href": self.href(f"/stream/{gid}/{token}/page/{n}"), "type": MIME_IMAGE}
+            {
+                "href": self.href(f"/stream/{gid}/{token}/page/{n}"),
+                "type": MIME_IMAGE,
+                "properties": {
+                    "x:thumbnail": {
+                        "href": self.href(
+                            f"/image/{gid}/{token}/page/{n}/thumb"
+                        ),
+                        "type": MIME_THUMB,
+                    }
+                },
+            }
             for n in range(base, base + page_count)
         ]

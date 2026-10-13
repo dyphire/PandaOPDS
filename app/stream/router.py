@@ -65,6 +65,30 @@ async def thumb(request: Request, gid: int, token: str):
     )
 
 
+@router.get("/image/{gid}/{token}/page/{page}/thumb")
+async def page_thumb(request: Request, gid: int, token: str, page: int):
+    service = _service(request)
+    settings = request.app.state.settings
+    base = settings.pse_page_base
+    if page < base:
+        raise HTTPException(status_code=400, detail=f"page must be >= {base} (PSE page base)")
+    try:
+        data, mime = await service.get_page_thumbnail(gid, token, page)
+    except ExceedLimitError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(int(settings.exceed_cooldown_seconds))},
+        ) from exc
+    except EHException as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": _IMAGE_CACHE},
+    )
+
+
 # Standard-cover CDN hosts allowed through /image/fetch (comment covers) come
 # from settings.image_proxy_hosts (configurable via IMAGE_PROXY_HOSTS, defaults
 # to the two cover CDNs). Restricting the host keeps the proxy from becoming
