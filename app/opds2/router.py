@@ -244,23 +244,20 @@ def _flatten_subjects(
         if category_first:
             index = 0
         else:
-            index = next(
-                (i for i, entry in enumerate(out) if "x:style" not in entry),
-                len(out),
-            )
+            # Keep the category after every highlighted tag even when the
+            # shared deterministic ordering interleaves styled and unstyled
+            # tags by namespace.
+            styled_indices = [
+                i for i, entry in enumerate(out) if "x:style" in entry
+            ]
+            index = max(styled_indices) + 1 if styled_indices else 0
         out.insert(index, category_entry)
     return out
 
 
-def _sort_tags(tags: list[GalleryTag]) -> list[GalleryTag]:
-    """Stable sort: highlighted tags (with style) first — list feeds only."""
-    return sorted(tags, key=lambda t: t.style is None)
-
-
-# Detail subject: namespace weight strictly per user spec, styled-first
-# *within* each namespace group. Unknown namespaces (temp/reclass/…) fall
-# after "other" preserving their original relative order.
-_DETAIL_NAMESPACE_ORDER = [
+# Shared list/detail ordering. Styles remain attached to tags for clients to
+# highlight, but never affect their serialization order.
+_TAG_NAMESPACE_ORDER = [
     "language",
     "parody",
     "character",
@@ -273,30 +270,24 @@ _DETAIL_NAMESPACE_ORDER = [
     "location",
     "other",
 ]
-_DETAIL_ORDER_INDEX = {ns: i for i, ns in enumerate(_DETAIL_NAMESPACE_ORDER)}
+_TAG_ORDER_INDEX = {ns: i for i, ns in enumerate(_TAG_NAMESPACE_ORDER)}
 
 
-def _sort_tags_detail(tags: list[GalleryTag]) -> list[GalleryTag]:
-    """Group-stable sort for detail subjects: namespace weight, styled first within group."""
-    if not tags:
-        return tags
-    # Group by namespace preserving first-appearance order (OrderedDict insertion order)
-    from collections import OrderedDict
+def _sort_tags(tags: list[GalleryTag]) -> list[GalleryTag]:
+    """Sort tags by namespace rank, then deterministically by namespace/key."""
+    def sort_key(tag: GalleryTag) -> tuple[int, str, str, str, str]:
+        namespace = tag.namespace
+        normalized_namespace = namespace.casefold()
+        rank = _TAG_ORDER_INDEX.get(normalized_namespace, len(_TAG_NAMESPACE_ORDER))
+        return (
+            rank,
+            "" if normalized_namespace in _TAG_ORDER_INDEX else normalized_namespace,
+            tag.key.casefold(),
+            namespace,
+            tag.key,
+        )
 
-    groups: OrderedDict[str, list[GalleryTag]] = OrderedDict()
-    for t in tags:
-        groups.setdefault(t.namespace, []).append(t)
-    # Sort namespaces by custom weight; unknown namespaces keep original relative order
-    # (stable sort: equal keys preserve insertion order)
-    ordered_namespaces = sorted(
-        groups.keys(),
-        key=lambda ns: _DETAIL_ORDER_INDEX.get(ns, len(_DETAIL_NAMESPACE_ORDER)),
-    )
-    out: list[GalleryTag] = []
-    for ns in ordered_namespaces:
-        lst = groups[ns]
-        out.extend(sorted(lst, key=lambda t: t.style is None))
-    return out
+    return sorted(tags, key=sort_key)
 
 
 def _apply_mytags_styles(
@@ -841,7 +832,7 @@ async def _detail_publication(
     else:
         styles = await service.get_mytags()
     tags = _apply_mytags_styles(tags, styles)
-    tags = _sort_tags_detail(tags)
+    tags = _sort_tags(tags)
     subjects = _flatten_subjects(
         tags, frozenset(), builder.translator, detail.category, category_first=True
     )

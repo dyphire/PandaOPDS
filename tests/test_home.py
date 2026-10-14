@@ -894,14 +894,14 @@ async def test_opds2_list_subject_styles_inline(tmp_path, monkeypatch):
     r = await _get("/opds/v2.0/gallery")
     assert r.status_code == 200
     md = r.json()["publications"][0]["metadata"]
-    # All highlighted tags stay first, then category, then unstyled tags;
-    # language and artist are included in the list subject too.
+    # Namespace/key ordering is shared with detail; category remains after
+    # highlighted tags, and language/artist are included in the list subject.
     assert md["subject"] == [
-        {"name": "female:netorare", "x:style": {"background": "#0f0"}},
-        {"name": "parody:Zenless Zone Zero", "x:style": {"color": "#fff"}},
-        {"name": "category:Manga"},
         {"name": "language:english"},
+        {"name": "parody:Zenless Zone Zero", "x:style": {"color": "#fff"}},
         {"name": "artist:Someone"},
+        {"name": "female:netorare", "x:style": {"background": "#0f0"}},
+        {"name": "category:Manga"},
         {"name": "male:uncertain"},
     ]
     assert "mytags" not in md  # side-channel bucket removed entirely
@@ -930,8 +930,8 @@ async def test_opds2_detail_subject_full_and_no_mytags(tmp_path, monkeypatch):
     r = await _get("/opds/v2.0/gallery/1/tok1")
     assert r.status_code == 200
     md = r.json()["publications"][0]["metadata"]
-    # Detail category leads; tag order remains namespace-weighted, styled-first
-    # within group after the synthetic category.
+    # Detail category leads; tags use the shared namespace/key order regardless
+    # of style after the synthetic category.
     assert md["subject"] == [
         {"name": "category:Manga"},
         {"name": "language:english"},
