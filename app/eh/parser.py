@@ -638,6 +638,11 @@ def _parse_list_item(
 
     favcat = _parse_favcat(row, view, name_to_id)
     tags = _parse_list_tags(row, view)
+    uploader = ""
+    for anchor in _el(row, "a[href]"):
+        if re.search(r"/uploader/", _attr(anchor, "href")):
+            uploader = _text(anchor)
+            break
     return GalleryListItem(
         gid=gallery_url.gid,
         token=gallery_url.token,
@@ -651,6 +656,7 @@ def _parse_list_item(
         is_expunged=is_expunged,
         favcat=favcat,
         tags=tags,
+        uploader=uploader,
     )
 
 

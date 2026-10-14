@@ -447,6 +447,8 @@ def _publication(
     ext: dict = {}
     if item.rating:
         ext["x:rating"] = item.rating
+    if item.uploader:
+        ext["x:uploader"] = item.uploader
 
     return builder.publication(
         gid=item.gid,

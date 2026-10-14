@@ -876,6 +876,7 @@ async def test_opds2_list_subject_styles_inline(tmp_path, monkeypatch):
     from app.eh.models import GalleryTag, TagStyle
 
     item = _item(1, "[Author] One")
+    item.uploader = "list-uploader"
     item.tags = [
         GalleryTag("language", "english", style=None),
         GalleryTag("artist", "Someone", style=None),
@@ -894,6 +895,7 @@ async def test_opds2_list_subject_styles_inline(tmp_path, monkeypatch):
     r = await _get("/opds/v2.0/gallery")
     assert r.status_code == 200
     md = r.json()["publications"][0]["metadata"]
+    assert md["x:uploader"] == "list-uploader"
     # Namespace/key ordering is shared with detail; category remains after
     # highlighted tags, and language/artist are included in the list subject.
     assert md["subject"] == [

@@ -194,6 +194,9 @@ class GalleryListItem:
     # the full set, thumbnail only featured tags, minimal none). Featured tags
     # carry `style`; non-featured tags have style=None.
     tags: list[GalleryTag] = field(default_factory=list)
+    # Uploader username from the extended list-row uploader link; empty when
+    # the active list layout does not expose one.
+    uploader: str = ""
 
 
 @dataclass

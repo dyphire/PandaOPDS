@@ -498,17 +498,19 @@ def test_parse_list_page_extended_tags():
 
 
 def test_parse_list_page_extended_extra_fields():
-    """Extended rows expose rating (`.ir` sprite), publish time and language."""
+    """Extended rows expose uploader, rating, publish time and language."""
     info = parse_list_page(EXTENDED_TAGS_HTML)
     g1, g2 = info.galleries
     # `background-position:0px -21px` → 5 - 0 - 0.5 = 4.5
     assert g1.rating == 4.5
     assert g1.publish_time == "2026-08-12 00:00"
     assert g1.language == "zh"  # language:chinese → BCP 47 zh
+    assert g1.uploader == "u1"
     # row without a posted element / rating sprite / tags → field defaults
     assert g2.rating == 0.0
     assert g2.publish_time == ""
     assert g2.language == ""
+    assert g2.uploader == ""
 
 
 def test_parse_list_page_compact_rating_and_publish_time():
