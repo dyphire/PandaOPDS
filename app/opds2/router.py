@@ -187,13 +187,6 @@ def _builder(request: Request) -> Opds2Builder:
     return builder
 
 
-# Namespaces excluded from the *list* subject (already exposed as dedicated
-# fields / parsed by the client): language (standalone field) and artist
-# (the client derives the author from image filenames). Detail documents
-# carry the full #taglist subject, so list subject stays a strict subset.
-_LIST_SUBJECT_EXCLUDED = frozenset({"language", "artist"})
-
-
 def _flatten_subjects(
     tags: list[GalleryTag],
     exclude: frozenset[str] = frozenset(),
@@ -205,9 +198,8 @@ def _flatten_subjects(
 
     Highlighted tags (with inline style) carry an ``x:style`` member — the
     style travels with its tag, replacing the old side-channel ``mytags``
-    bucket. List feeds pass ``_LIST_SUBJECT_EXCLUDED`` to drop fields already
-    exposed elsewhere; detail documents pass nothing (complete #taglist;
-    highlight styles are backfilled from the My Tags map by the caller).
+    bucket. Both list feeds and detail documents include the complete tag set;
+    detail highlight styles are backfilled from the My Tags map by the caller.
 
     When a tag translator (EhTagTranslation, opt-in) is supplied and knows the
     tag, ``name`` becomes Chinese-namespace plus translated name (emoji
@@ -448,9 +440,8 @@ def _publication(
 
     Browsing feeds never call the ehapi; ``x:*`` metadata carries only what
     the list page exposed (rating), while category and highlighted-tag styles
-    travel inline on `subject` entries. Full tags live in `subject` (minus
-    fields exposed elsewhere: language/artist). The client opens the detail
-    document for full metadata.
+    travel inline on `subject` entries. The complete tag set lives in
+    `subject`.
     """
     category = item.category
     modified = _item_modified(item)
@@ -461,9 +452,7 @@ def _publication(
 
     tags = apply_status_filter(list(item.tags), builder.settings.tag_status_filter)
     tags = _sort_tags(tags)
-    subjects = _flatten_subjects(
-        tags, _LIST_SUBJECT_EXCLUDED, builder.translator, item.category
-    )
+    subjects = _flatten_subjects(tags, translator=builder.translator, category=item.category)
     ext: dict = {}
     if item.rating:
         ext["x:rating"] = item.rating

@@ -871,9 +871,8 @@ async def test_opds2_detail_without_newer_versions_omits_note(
 
 @pytest.mark.asyncio
 async def test_opds2_list_subject_styles_inline(tmp_path, monkeypatch):
-    """subject entries are RWPM objects; highlighted tags carry inline
-    x:style (replacing the old mytags side-channel), and subject excludes
-    language/artist while keeping the rest."""
+    """subject entries include all tags; highlighted tags carry inline
+    x:style (replacing the old mytags side-channel)."""
     from app.eh.models import GalleryTag, TagStyle
 
     item = _item(1, "[Author] One")
@@ -895,12 +894,14 @@ async def test_opds2_list_subject_styles_inline(tmp_path, monkeypatch):
     r = await _get("/opds/v2.0/gallery")
     assert r.status_code == 200
     md = r.json()["publications"][0]["metadata"]
-    # list subject: full set minus language/artist (skepticism kept: balanced);
-    # All highlighted tags stay first, then category, then unstyled tags.
+    # All highlighted tags stay first, then category, then unstyled tags;
+    # language and artist are included in the list subject too.
     assert md["subject"] == [
         {"name": "female:netorare", "x:style": {"background": "#0f0"}},
         {"name": "parody:Zenless Zone Zero", "x:style": {"color": "#fff"}},
         {"name": "category:Manga"},
+        {"name": "language:english"},
+        {"name": "artist:Someone"},
         {"name": "male:uncertain"},
     ]
     assert "mytags" not in md  # side-channel bucket removed entirely
