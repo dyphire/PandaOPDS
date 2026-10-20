@@ -132,7 +132,12 @@ button.btn:disabled { opacity: .5; cursor: not-allowed; }
 .fav-panel button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .fav-panel button.danger { color: var(--red); border-color: rgba(248,81,73,.4); }
 .fav-panel button.danger:hover { background: rgba(248,81,73,.15); }
-.gl-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--bg-3); justify-content: space-between; }
+.gl-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--bg-3); justify-content: flex-start; }
+.gl-actions .icon-btn { width: 34px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.gl-actions a.icon-btn { background: var(--bg-3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; text-decoration: none; }
+.gl-actions .icon-btn:hover { background: var(--bg-hover); }
+.gl-actions .icon-btn svg { width: 16px; height: 16px; }
+.gl-actions .icon-btn.danger:hover { background: rgba(248,81,73,.15); }
 </style>
 </head>
 <body>
@@ -487,19 +492,28 @@ async function loadArchive() {
       const favLabel = e.is_favorited ? (e.favcat_name || '已收藏') : '未收藏';
       const favCls = e.is_favorited ? 'fav-cover fav' : 'fav-cover not';
       const favBadge = '<span class="'+favCls+'" onclick="openFavPanel(event,'+e.gid+',\''+esc(e.token)+'\','+(e.favcat!=null?e.favcat:'null')+')">'+esc(favLabel)+'</span>';
-      const statusMap = {ready:["green","可用"],downloading:["blue","下载中"],zipping:["blue","转换中"],pending:["yellow","准备中"],failed:["red","失败"]};
+      const tier = String(e.or || e.quality || "").toLowerCase();
+      const readyLabel = tier === "res" || tier.includes("resample") ? "降采样"
+        : tier === "org" || tier.includes("original") ? "原档" : "可用";
+      const statusMap = {ready:["green",readyLabel],downloading:["blue","下载中"],zipping:["blue","转换中"],pending:["yellow","准备中"],failed:["red","失败"]};
       const stPair = statusMap[e.status] || ["gray", e.status];
       const coverTitle = '<div class="gl-cover-title"><div class="glink">'+esc(title)+'</div></div>';
       const coverWithBadge = '<div class="gl1e">'+cover+coverTitle+favBadge+'</div>';
-      const statusBadge = '<span class="badge '+stPair[0]+'">'+esc(stPair[1])+'</span>';
-      const err = e.error ? '<div class="err" style="font-size:11px;margin-top:6px">'+esc(e.error)+'</div>' : '';
+      const errorTip = e.status === 'failed' && e.error ? ' title="'+esc(e.error)+'"' : '';
+      const statusBadge = '<span class="badge '+stPair[0]+'"'+errorTip+'>'+esc(stPair[1])+'</span>';
       const statsRow = '<div class="meta-stats">'+pages+size+'</div>';
+      const galleryUrl = 'https://e-hentai.org/g/'+encodeURIComponent(e.gid)+'/'+encodeURIComponent(e.token)+'/';
+      const openGalleryButton = '<a class="btn icon-btn" href="'+esc(galleryUrl)+'" target="_blank" rel="noopener noreferrer" title="在 E-Hentai 打开图库" aria-label="在 E-Hentai 打开图库"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></a>';
+      const metadataButton = '<button class="btn icon-btn" title="更新元数据" aria-label="更新元数据" onclick="refreshMetadata('+e.gid+',\''+esc(e.token)+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h10l4 4v3"/><path d="M14 5v4h4"/><path d="M7 12h6"/><path d="M7 16h4"/><path d="M5 19a7 7 0 0 0 12.2 1.1"/><path d="M19 20v-4h-4"/></svg></button>';
+      const retryButton = e.status === 'failed'
+        ? '<button class="btn icon-btn" title="重试归档" aria-label="重试归档" onclick="refreshArchive('+e.gid+',\''+esc(e.token)+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 1-2.3-5.7L20 9"/></svg></button>'
+        : '';
+      const deleteButton = '<button class="btn icon-btn danger" title="删除本地归档" aria-label="删除本地归档" onclick="deleteArchive('+e.gid+',\''+esc(e.token)+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg></button>';
       return '<div class="gl-card">'
         + coverWithBadge
-        + '<div class="gl-thumb-meta"><div class="meta-top"><span style="display:flex;gap:6px;align-items:center">'+cat+rating+'</span>'+statusBadge+'</div><div class="meta-bottom">'+statsRow+'</div>'+err+'</div>'
+        + '<div class="gl-thumb-meta"><div class="meta-top"><span style="display:flex;gap:6px;align-items:center">'+cat+rating+'</span>'+statusBadge+'</div><div class="meta-bottom">'+statsRow+'</div></div>'
         + '<div class="gl-actions">'
-            + '<button class="btn" onclick="refreshMetadata('+e.gid+',\''+esc(e.token)+'\')">更新元数据</button>'
-            + '<button class="btn danger" onclick="deleteArchive('+e.gid+',\''+esc(e.token)+'\')">删除</button>'
+            + openGalleryButton + metadataButton + retryButton + deleteButton
         + '</div>'
       + '</div>';
     }).join('');

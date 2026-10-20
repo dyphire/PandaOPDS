@@ -180,8 +180,9 @@ class ArchiveManager:
         self.throttle = throttle
         self.store = store
         # Optional service layer: when injected, a gdata metadata + cover
-        # snapshot is persisted after each successful archive download (and on
-        # manual refresh). None keeps the manager self-contained (tests).
+        # snapshot is persisted at the start of each archive task, retried
+        # after a successful download if the early snapshot failed, and on
+        # manual refresh. None keeps the manager self-contained (tests).
         self.service = service
         self._slots = asyncio.Semaphore(settings.archive_download_concurrency)
         self._tasks: dict[str, asyncio.Task] = {}
@@ -375,6 +376,7 @@ class ArchiveManager:
         page = parse_archiver_page(html)
         if page.error:
             raise self._map_error(page.error)
+        gallery_title = page.title
 
         option = self._match_option(
             page.options, quality, self.settings.archive_quality
@@ -424,7 +426,10 @@ class ArchiveManager:
             )
 
         await self.store.upsert(gid, token, {
-            "title": page.title or None,
+            # The submit/preparing page often omits the gallery title. Keep
+            # the one from the options page so a later failed task remains
+            # identifiable even when its gdata snapshot is unavailable.
+            "title": page.title or gallery_title or None,
             "quality": option.label,
             "or": option.or_value,
             "gp_price": option.gp_price,
@@ -452,7 +457,10 @@ class ArchiveManager:
         meta = self.store.get(gid, token)
         if meta is None:
             raise EHException("no archive entry to refresh (start first)")
-        return await self.start(gid, token, quality=meta.get("or"), force=True)
+        # Prefer the persisted dltype; fall back to the historical quality
+        # label for entries written before ``or`` was stored.
+        quality = self.stored_tier(meta) or meta.get("quality")
+        return await self.start(gid, token, quality=quality, force=True)
 
     async def remove(self, gid: int, token: str) -> bool:
         """Cancel any in-flight task and delete the local entry."""
@@ -474,10 +482,11 @@ class ArchiveManager:
     ) -> dict | None:
         """Fetch gdata metadata + cover and persist them as a local snapshot.
 
-        Runs after a successful archive download (and on manual refresh).
-        Best-effort by design: failures are logged and never fail the archive
-        task — the entry stays ready; a missing snapshot is regenerated on
-        the next manual refresh.
+        Runs as soon as the background archive task starts, before preparation
+        polling or file transfer. If that early attempt fails, the caller may
+        retry after a successful download. Manual refresh also forces a new
+        snapshot. Best-effort by design: metadata failures never fail archive
+        work.
         """
         if self.service is None:
             return None
@@ -790,6 +799,9 @@ class ArchiveManager:
         meta = self.store.get(gid, token)
         if meta is None:
             return
+        # Make the gallery recognizable in the archive list even if the
+        # upstream archive later fails during preparation or transfer.
+        snapshot = await self._snapshot_metadata(gid, token)
         status = meta["status"]
         if status == ST_PENDING:
             await self._wait_ready(gid, token)
@@ -798,8 +810,11 @@ class ArchiveManager:
             return  # cancelled / failed / removed meanwhile
         await self._download(gid, token)
         await self._finalize(gid, token)
-        # Best-effort gdata + cover snapshot (never fails the task).
-        await self._snapshot_metadata(gid, token)
+        # Retry a transient metadata failure once the archive is ready. A
+        # successful early snapshot is already sufficient and avoids a
+        # duplicate gdata request on every successful archive.
+        if snapshot is None:
+            await self._snapshot_metadata(gid, token)
 
     async def _wait_ready(self, gid: int, token: str) -> None:
         """Poll the hath.network status URL until the archive is ready."""
